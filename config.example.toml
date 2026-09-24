@@ -471,6 +471,13 @@ redis_password = ""
 max_concurrent_tasks = 5
 max_queued_tasks = 100
 
+# Maximum number of videos rendered in parallel inside a single task when
+# video_count > 1. Set to 1 to keep the old fully-sequential behaviour. Each
+# parallel render uses its own FFmpeg threads (video_clip/threads) and memory.
+# 单个任务里 video_count > 1 时最多并行合成的成片数；设为 1 恢复旧的串行
+# 行为。每路并行渲染都会占用各自的 FFmpeg 线程和内存。
+video_parallelism = 4
+
 # -----------------------------------------------------------------------------
 # Cross-platform Publishing / 跨平台发布
 # -----------------------------------------------------------------------------

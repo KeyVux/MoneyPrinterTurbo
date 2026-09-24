@@ -4,6 +4,7 @@ import math
 import os
 import random
 import gc
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -374,20 +375,39 @@ def _disable_runtime_video_codec(codec: str, reason: str):
 
 def _get_temp_audio_dir(output_dir: str) -> str:
     """
-    Return the directory to use for MoviePy's temporary audio file.
+    Return a per-render directory for MoviePy's temporary audio file.
+
+    MoviePy names that temp file from the output file's basename, e.g.
+    ``final-1TEMP_MPY_wvf_snd.mp4``. Two renders of the same basename running
+    concurrently (the same task's multiple final videos, or two tasks on the
+    machine) therefore collide unless each render gets its own directory.
 
     On Windows, Windows Defender can lock files written to the task output
     directory while scanning them, causing MoviePy to fail with a
     PermissionError (WinError 32) on the TEMP_MPY_wvf_snd temp file and
-    leaving the final MP4 at 0 bytes.  Using the system temp directory
-    sidesteps the scan without changing behaviour on other platforms.
+    leaving the final MP4 at 0 bytes. A fresh unique directory under the system
+    temp sidesteps the scan *and* keeps concurrent renders isolated. Callers
+    must remove the returned directory after writing (see
+    ``_cleanup_temp_audio_dir``).
 
-    On Linux/macOS/Docker the output directory is returned unchanged so
-    existing behaviour is preserved.
+    On Linux/macOS/Docker the task output directory is returned unchanged so
+    existing behaviour is preserved; there each task already owns a unique
+    directory.
     """
     if sys.platform == "win32":
-        return tempfile.gettempdir()
+        return tempfile.mkdtemp(prefix="mpt-moviepy-")
     return output_dir
+
+
+def _cleanup_temp_audio_dir(temp_audio_dir: str, output_dir: str) -> None:
+    """
+    Remove a per-render MoviePy temp directory created by ``_get_temp_audio_dir``.
+
+    ``_get_temp_audio_dir`` returns the task output directory on non-Windows
+    platforms; that directory must never be removed here.
+    """
+    if temp_audio_dir != output_dir:
+        shutil.rmtree(temp_audio_dir, ignore_errors=True)
 
 
 def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
@@ -486,7 +506,12 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
 ):
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
+    # 拼接列表文件名必须相对输出文件唯一，否则同一任务目录内并发拼接多路
+    # 视频时，各路会互相覆盖同一份 list，`finally` 清理还会误删仍在读取的文件。
+    concat_list_file = os.path.join(
+        output_dir,
+        f".{os.path.splitext(os.path.basename(output_file))[0]}-ffmpeg-concat-list.txt",
+    )
     with open(concat_list_file, "w", encoding="utf-8") as fp:
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
@@ -785,6 +810,9 @@ def combine_videos(
     # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
     source_clip_duration = max_clip_duration * normalized_clip_speed
     output_dir = os.path.dirname(combined_video_path)
+    # 中间片段文件名必须带上输出视频的名字，否则同一任务目录内并发拼接多路
+    # 视频时，各路都会写入相同的 temp-clip-*.mp4 并互相覆盖正在编码的文件。
+    combined_base = os.path.splitext(os.path.basename(combined_video_path))[0]
 
     aspect = VideoAspect(video_aspect)
     fit_mode = VideoFitMode(video_fit_mode)
@@ -904,7 +932,7 @@ def combine_videos(
                 clip = clip.subclipped(0, max_clip_duration)
                 
             # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            clip_file = f"{output_dir}/temp-clip-{combined_base}-{i+1}.mp4"
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
@@ -1515,18 +1543,25 @@ def generate_video(
         # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
         # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
         output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-        _write_videofile_with_codec_fallback(
-            final_video_clip,
-            output_file=output_file,
-            codec=_get_configured_video_codec(),
-            audio_codec=audio_codec,
-            audio_fps=output_audio_fps,
-            audio_bitrate=audio_bitrate,
-            temp_audiofile_path=_get_temp_audio_dir(output_dir),
-            threads=params.n_threads or 2,
-            logger=None,
-            fps=fps,
-        )
+        # 每个渲染使用独立的临时目录，避免并发渲染（同一任务的多路成片，或
+        # 多任务同时运行）在共享的系统临时目录里复用 MoviePy 基于输出文件名
+        # 生成的同名临时音频文件，导致 WinError 32 文件占用冲突。
+        temp_audio_dir = _get_temp_audio_dir(output_dir)
+        try:
+            _write_videofile_with_codec_fallback(
+                final_video_clip,
+                output_file=output_file,
+                codec=_get_configured_video_codec(),
+                audio_codec=audio_codec,
+                audio_fps=output_audio_fps,
+                audio_bitrate=audio_bitrate,
+                temp_audiofile_path=temp_audio_dir,
+                threads=params.n_threads or 2,
+                logger=None,
+                fps=fps,
+            )
+        finally:
+            _cleanup_temp_audio_dir(temp_audio_dir, output_dir)
         return bgm_mix_succeeded
 
 

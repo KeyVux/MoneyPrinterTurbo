@@ -1406,10 +1406,21 @@ class TestVideoService(unittest.TestCase):
         finally:
             clip.close()
 
-    def test_get_temp_audio_dir_returns_system_temp_on_windows(self):
+    def test_get_temp_audio_dir_returns_unique_dir_under_system_temp_on_windows(self):
+        """Windows 上必须为每次渲染返回独立目录，避免并发渲染共用同名临时音频。"""
         with patch("sys.platform", "win32"):
-            result = vd._get_temp_audio_dir("/some/output/dir")
-            self.assertEqual(result, tempfile.gettempdir())
+            first = vd._get_temp_audio_dir("/some/output/dir")
+            second = vd._get_temp_audio_dir("/some/output/dir")
+            try:
+                self.assertTrue(first.startswith(tempfile.gettempdir()))
+                self.assertTrue(second.startswith(tempfile.gettempdir()))
+                self.assertNotEqual(first, second)
+                self.assertTrue(os.path.isdir(first))
+            finally:
+                vd._cleanup_temp_audio_dir(first, "/some/output/dir")
+                vd._cleanup_temp_audio_dir(second, "/some/output/dir")
+            self.assertFalse(os.path.exists(first))
+            self.assertFalse(os.path.exists(second))
 
     def test_get_temp_audio_dir_returns_output_dir_on_non_windows(self):
         for platform in ("linux", "darwin"):
@@ -1417,6 +1428,16 @@ class TestVideoService(unittest.TestCase):
                 with patch("sys.platform", platform):
                     result = vd._get_temp_audio_dir("/some/output/dir")
                     self.assertEqual(result, "/some/output/dir")
+
+    def test_cleanup_temp_audio_dir_never_removes_the_output_directory(self):
+        """非 Windows 路径返回的是任务输出目录本身，清理绝不能删除它。"""
+        with (
+            patch("sys.platform", "linux"),
+            patch.object(vd.shutil, "rmtree") as rmtree,
+        ):
+            output_dir = vd._get_temp_audio_dir("/some/output/dir")
+            vd._cleanup_temp_audio_dir(output_dir, output_dir)
+        rmtree.assert_not_called()
 
 
 class TestMaterialResolutionTolerance(unittest.TestCase):

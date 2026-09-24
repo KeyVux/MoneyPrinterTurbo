@@ -880,6 +880,20 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
         return {}
 
 
+def _configured_video_parallelism() -> int:
+    """
+    返回单任务内多个成片允许并行合成（拼接 + 最终渲染）的线程数。
+
+    多路渲染会各自占用 FFmpeg 线程（``n_threads``）和内存，因此默认值保持
+    保守（4），避免小机器上多条编码同时运行互相拖垮。
+    """
+    try:
+        configured = int(config.app.get("video_parallelism", 4) or 1)
+    except (TypeError, ValueError):
+        configured = 4
+    return max(1, configured)
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
@@ -911,12 +925,13 @@ def generate_final_videos(
         video_concat_mode = VideoConcatMode.random
     video_transition_mode = params.video_transition_mode
 
+    task_dir = utils.task_dir(task_id)
+    progress_lock = threading.RLock()
     _progress = 50
-    for i in range(params.video_count):
-        index = i + 1
-        combined_video_path = path.join(
-            utils.task_dir(task_id), f"combined-{index}.mp4"
-        )
+
+    def _combine_index(index: int) -> str:
+        nonlocal _progress
+        combined_video_path = path.join(task_dir, f"combined-{index}.mp4")
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
         used_video_paths = []
         batch_options = (
@@ -941,6 +956,9 @@ def generate_final_videos(
             **batch_options,
         )
         if allocate_batch_materials:
+            # 素材分配状态是跨成片共享的，必须按成片顺序推进。这个分支只在
+            # 顺序拼接阶段（主线程）执行，因此这里对共享字典和清单的读写是
+            # 安全的，也不能挪进后面的并行渲染线程。
             selected_sources = list(dict.fromkeys(used_video_paths))
             reused_sources = [file for file in selected_sources if source_usage.get(file, 0)]
             for file in selected_sources:
@@ -962,10 +980,15 @@ def generate_final_videos(
                     "count": len(reused_sources),
                 })
 
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
+        with progress_lock:
+            _progress += 50 / params.video_count / 2
+            sm.state.update_task(task_id, progress=_progress)
+        return combined_video_path
 
-        final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
+    def _render_index(index: int, combined_video_path: str) -> tuple:
+        nonlocal _progress
+        final_video_path = path.join(task_dir, f"final-{index}.mp4")
+        index_warnings = []
 
         # 视频配乐模式先明确禁用默认 BGM 解析，避免旧任务残留的 bgm_file 被
         # 误用。只有音量大于 0 才生成代理并调用付费 API；0 音量统一跳过。
@@ -975,7 +998,7 @@ def generate_final_videos(
             display_name = video_music_provider["display_name"]
             warning_code = video_music_provider["warning_code"]
             generated_bgm_path = path.join(
-                utils.task_dir(task_id),
+                task_dir,
                 (f"{params.bgm_type}-bgm-{index}{video_music_provider['suffix']}"),
             )
             try:
@@ -994,7 +1017,7 @@ def generate_final_videos(
                     f"video_index={index}, error={exc}"
                 )
                 bgm_file_override = ""
-                warnings.append({"code": warning_code, "video_index": index})
+                index_warnings.append({"code": warning_code, "video_index": index})
 
         logger.info(f"\n\n## generating video: {index} => {final_video_path}")
         bgm_mix_succeeded = video.generate_video(
@@ -1013,18 +1036,65 @@ def generate_final_videos(
             # 第三方已成功返回并通过 FFmpeg 校验，但 MoviePy 最终混音仍可能
             # 因运行环境失败。视频服务会保留无 BGM 成片；API 生成失败时
             # override 为空，因此不会重复追加警告。
-            warnings.append(
+            index_warnings.append(
                 {
                     "code": video_music_provider["warning_code"],
                     "video_index": index,
                 }
             )
 
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
+        with progress_lock:
+            _progress += 50 / params.video_count / 2
+            sm.state.update_task(task_id, progress=_progress)
+        return index, final_video_path, combined_video_path, index_warnings
 
+    def _generate_one(index: int) -> tuple:
+        combined_video_path = _combine_index(index)
+        return _render_index(index, combined_video_path)
+
+    def _collect_in_index_order(futures_by_index: dict) -> list:
+        ordered = []
+        try:
+            for index in sorted(futures_by_index):
+                ordered.append(futures_by_index[index].result())
+        except Exception:
+            # 任一成片失败时取消尚未启动的并发任务，避免在失败路径上继续
+            # 无谓地编码多余视频；行为与旧的顺序循环"首个异常即中止"一致。
+            for future in futures_by_index.values():
+                future.cancel()
+            raise
+        return ordered
+
+    worker_count = min(params.video_count, _configured_video_parallelism())
+    with ThreadPoolExecutor(
+        max_workers=max(1, worker_count),
+        thread_name_prefix="mpt-video",
+    ) as executor:
+        if allocate_batch_materials:
+            # 批次素材分配需要按成片顺序读取/更新共享状态，因此拼接阶段保持
+            # 顺序执行；拼接一完成就把该成片的最终渲染提交到线程池，让多路
+            # 渲染与后续拼接重叠进行，同时保持分配结果的确定性。
+            futures_by_index = {}
+            for i in range(params.video_count):
+                index = i + 1
+                combined_video_path = _combine_index(index)
+                futures_by_index[index] = executor.submit(
+                    _render_index, index, combined_video_path
+                )
+            ordered = _collect_in_index_order(futures_by_index)
+        else:
+            # 无批次分配状态时，各路拼接与渲染相互独立，可以直接全部并行。
+            futures_by_index = {
+                index: executor.submit(_generate_one, index)
+                for index in range(1, params.video_count + 1)
+            }
+            ordered = _collect_in_index_order(futures_by_index)
+        executor.shutdown(wait=True)
+
+    for _, final_video_path, combined_video_path, index_warnings in ordered:
         final_video_paths.append(final_video_path)
         combined_video_paths.append(combined_video_path)
+        warnings.extend(index_warnings)
 
     return final_video_paths, combined_video_paths, warnings
 
